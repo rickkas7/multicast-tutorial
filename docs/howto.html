@@ -1,0 +1,239 @@
+<!DOCTYPE HTML PUBLIC "-//W3C//DTD HTML 4.01 Transitional//EN" "http://www.w3.org/TR/html4/loose.dtd">
+<html>
+
+	<head>
+		<title>Particle Multicast UDP Tutorial</title>
+	</head>
+	<body>
+	
+
+<p>There are a bunch of ways to get data off a Particle onto a server or client on your local network. If the data doesn't change very often, the 
+<a href="https://docs.particle.io/reference/firmware/core/#cloud-functions">Particle cloud functions</a>, either variables (pull) or events and SSE (push) are the easiest and where the Particle excels. If you can, you should use those methods.</p>
+
+<p>You can also use a <a href="https://docs.particle.io/reference/firmware/core/#tcpclient">TCP connection</a>
+to stream large amounts of data in real-time, but this can be a problem when you might need more than one client (receiver of the data from the Particle), or the client moves from machine to machine or the destination IP address changes frequently.</p>
+
+<p>Another option, the one I investigate here, is to use <a href="https://en.wikipedia.org/wiki/IP_multicast">multicast UDP</a>. It works!</p>
+
+<p>Without going into too much detail, UDP, the <a href="https://en.wikipedia.org/wiki/User_Datagram_Protocol">User Datagram Protocol</a>, is one of the low-level TCP/IP protocols. It allows relatively small packets of data (up to 512 bytes always, and often up to 8 Kbytes, sometimes larger) to be sent between devices. The delivery is unreliable; packets may be dropped, or they may be delivered out of order.</p>
+
+<p>This is a problem in some cases, but in my application, it was fine. I wanted to stream anemometer (wind speed and direction) information in real-time. If the wind was blowing, I wanted to be able to update the values at least once per second, more often than I could send through the cloud. But if I lost a packet, no big deal.</p>
+
+<p>Normal UDP is unicast or point-to-point; you need to know the host name or IP address and port to send the data to. This is fine if the data is going to a known server on your network. Or you can use the Particle function feature to communicate the host and port to the Particle, but this gets messy and at high data rates, the Particle can't serve too many unicast clients.</p>
+
+<p>But there's another way: Multicast UDP. Basically, the Particle sends data once by UDP, and it's received automatically by as many clients as are interested in it. Your home router takes care of all of the work, so the Particle doesn't get overloaded. Multicast can also be used across the Internet, in some cases, but that's more complicated, and security is a problem, so we won't deal with that here.</p>
+
+<p>Normally, IP addresses on your home network will be something like 192.168.x.x or 10.x.x.x, but multicast IP addresses are in special ranges. In my example, I use the 239.x.x.x IP range, which is available for organization-specific use within a single local area network. I arbitrarily picked 239.1.1.234. If you're on a company network, you'll have to make sure you're not using an address already in use.</p>
+
+<p>The other parameter is the UDP port number (1-65535). The port number must be not otherwise used by any computer that's receiving the data. Ports less than 1024 generally require root permissions for Unix-based machines. A safe bet is usually anything above 4096 and less than 49152, though there are a bunch of <a href="https://en.wikipedia.org/wiki/List_of_TCP_and_UDP_port_numbers">obscure exceptions</a>. I arbitrarily picked 7123.</p>
+
+<p>Also, remember that this is only suitable for non-sensitive data! Not only are the packets not encrypted, but anyone on your local network or Wi-Fi can subscribe to them and see the data. Also, there's nothing preventing a rogue server from pushing bogus data to the clients. But, again, for anemometer data on my home network, this is acceptable.</p>
+
+<p>The full source code for the examples below is on github:<br/>
+<a href="https://github.com/rickkas7/multicast-tutorial">https://github.com/rickkas7/multicast-tutorial</a></p>
+
+<h2>Test circuit</h2>
+
+<p>The test circuit is just a potentiometer connected to A0 as an analog input. When read using analogRead, this results in values from 0-4095. I used this for testing on my desk instead of the actual anemometer, which is unwieldy!</p>
+
+<h2>Server software (Particle)</h2>
+
+<p>The server software is just a simple app that does some setup, reads from A0 using analogRead, and if the value changes, sends a packet of data using UDP multicast.</p>
+
+<p>In this sample code, I send the data only when it changes, which makes sense. But since it's based on UDP and packets might be lost, it probably would also be a good idea to also transmit a packet periodically, maybe every 15 seconds or something, in case the last change was lost, or to provide initial state for a newly connected client.</p>
+
+<p><pre>// Multicast Sample Code
+
+// Define this to also output debugging information to the serial console
+//#define SERIAL_DEBUG
+
+int lastValue = 0;
+
+// UDP support
+UDP udp;
+const size_t bufferSize = 16; // Make this bigger if you have more data!
+unsigned char buffer[bufferSize];
+// Note: remoteIP is a multicast address, it should begin with 239.x.x.x or some other
+// appropriate multicast address.
+// It's not the same as your local IP address (192.168.x.x, for example)!
+IPAddress remoteIP(239,1,1,234);
+
+// The remote port must be otherwise unused on any machine that is receiving these packets
+int remotePort = 7234;
+
+
+void setup() {
+    #ifdef SERIAL_DEBUG
+    Serial.begin(9600);
+    #endif
+
+    // We don't listen for UDP packets, so pass 0 here.
+    udp.begin(0);
+
+    pinMode(A0, INPUT);
+    Particle.variable("value", lastValue);
+}
+
+void loop() {
+    int value = analogRead(A0);
+
+    int delta = value - lastValue;
+
+    // Only send a packet when data change is sufficiently large
+    if (delta &lt; -3 || delta &gt; 3) {
+        // Data buffer, we send the 16-bit integer value in network byte order (big endian)
+        buffer[0] = value &gt;&gt; 8;
+        buffer[1] = (value &amp; 0xff);
+
+        // Send the data
+        if (udp.sendPacket(buffer, bufferSize, remoteIP, remotePort) &gt;= 0) {
+            // Success
+            #ifdef SERIAL_DEBUG
+            Serial.printlnf("%d", value);
+            #endif
+        }
+        else {
+            #ifdef SERIAL_DEBUG
+            Serial.printlnf("send failed");
+            #endif
+            // On error, wait a moment, then reinitialize UDP and try again.
+            delay(1000);
+            udp.begin(0);
+        }
+
+        lastValue = value;
+    }
+
+    delay(100);
+}</pre></p>
+
+<h2>Client software (Java)</h2>
+
+<p>This is a simple Java text-based app that subscribes to UDP multicast and prints the value in any packet received in a loop. I tested this on a Mac, but theoretically it should work on all platforms that support multicast and Java.</p>
+
+<p>The main difference between this and standard UDP code is that you instantiate a MulticastSocket and use the joinGroup() method to specify which multicast IP address to subscribe to. The actual receiving of the data looks like normal UDP code.</p>
+
+<p><pre>MulticastSocket socket = null;
+InetAddress group = null;
+
+try {
+        socket = new MulticastSocket(7234);
+        group = InetAddress.getByName("239.1.1.234");
+        socket.joinGroup(group);
+
+        DatagramPacket packet;
+        while(true) {
+            byte[] buf = new byte[256];
+            packet = new DatagramPacket(buf, buf.length);
+            socket.receive(packet);
+
+            // Java byte values are signed. Convert to an int so we don't have to deal with negative values for bytes &gt;= 0x7f (unsigned).
+            int[] valueBuf = new int[2];
+            for(int ii = 0; ii &lt; valueBuf.length; ii++) {
+                valueBuf[ii] = (buf[ii] &gt;= 0) ? (int)buf[ii] : (int)buf[ii] + 256;
+            }
+            
+            int value = (valueBuf[0] &lt;&lt; 8) | valueBuf[1];
+            
+            System.out.println(value);
+        }</pre></p>
+
+<h2>Client software (Python)</h2>
+
+<p>Same thing, but written in Python. I tested this on a Mac and Ubuntu Linux, but theoretically it should work on all platforms that support multicast and Python.</p>
+
+<p><pre>#!/usr/bin/python
+
+import socket
+import struct
+
+# http://stackoverflow.com/questions/603852/multicast-in-python
+MCAST_GRP = '239.1.1.234'
+MCAST_PORT = 7234
+
+sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM, socket.IPPROTO_UDP)
+
+sock.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+
+sock.bind((MCAST_GRP, MCAST_PORT))
+mreq = struct.pack("4sl", socket.inet_aton(MCAST_GRP), socket.INADDR_ANY)
+
+sock.setsockopt(socket.IPPROTO_IP, socket.IP_ADD_MEMBERSHIP, mreq)
+
+while True:
+  data = sock.recv(16)
+  print (ord(data[0]) &lt;&lt; 8) | ord(data[1]);
+</pre></p>
+
+<h2>Client software (iOS, Objective-C)</h2>
+
+<p>This is just a simple app for iOS to make sure it works. When new packets are received, items are added to the scrolling list with the value.</p>
+
+<p>I did use the GCDAsyncUdpSocket library. You only need the single file from it, and it makes the code much easier to work with.</p>
+
+<p>My code is all in ViewController.m. It should be self-explanatory.</p>
+
+<p><pre>- (void)setupSocket
+{
+    // http://stackoverflow.com/questions/13459116/how-to-receive-multicast-udp
+    self.udpSocket = [[GCDAsyncUdpSocket alloc] initWithDelegate:self delegateQueue:dispatch_get_main_queue()];
+    NSError *error = nil;
+    if (![self.udpSocket bindToPort:7234 error:&amp;error])
+    {
+        NSLog(@"Error binding to port: %@", error);
+        return;
+    }
+    if(![self.udpSocket joinMulticastGroup:@"239.1.1.234" error:&amp;error]){
+        NSLog(@"Error connecting to multicast group: %@", error);
+        return;
+    }
+    if (![self.udpSocket beginReceiving:&amp;error])
+    {
+        NSLog(@"Error receiving: %@", error);
+        return;
+    }
+    NSLog(@"Socket Ready");
+}
+
+// GCDAsyncUdpSocketDelegate
+- (void)udpSocket:(GCDAsyncUdpSocket *)sock didReceiveData:(NSData *)data
+    fromAddress:(NSData *)address withFilterContext:(id)filterContext
+{
+    const unsigned char *bytes = [data bytes];
+    
+    int value = (bytes[0] &lt;&lt; 8) | bytes[1];
+
+    NSString *str = [[NSString alloc] initWithFormat:@"%d", value];
+    [self.items addObject:str];
+    [self.tableView reloadData];
+
+    
+    NSLog(@"got data %d", value);
+}
+</pre></p>
+
+<h2>Client software (Android)</h2>
+
+<p>There are a couple of caveats to using multicast in Android. You must add permissions to AndroidManfest.xml:</p>
+
+<p><pre>&lt;uses-permission android:name="android.permission.ACCESS_NETWORK_STATE"/&gt;
+&lt;uses-permission android:name="android.permission.ACCESS_WIFI_STATE"/&gt;
+&lt;uses-permission android:name="android.permission.CHANGE_WIFI_MULTICAST_STATE"/&gt;
+&lt;uses-permission android:name="android.permission.INTERNET"/&gt;</pre></p>
+
+<p>You must create a multicast lock. By default, multicast packets are discarded because processing them uses extra battery power. You must tell the device you want to process them, perhaps in onCreate().</p>
+
+<p><pre>WifiManager wifi = (WifiManager)getSystemService(Context.WIFI_SERVICE);
+if (wifi != null){
+    WifiManager.MulticastLock lock = wifi.createMulticastLock("HelloAndroid");
+    lock.acquire();
+}</pre></p>
+
+<p>The networking code runs in a worker thread (runThread()) because socket.receive() is blocking and you can't run it from the main UI thread. However updating the user interface must be done from the UI thread, so that's the runOnUiThread() code.</p>
+
+
+
+
+	</body>
+	
+</html>
